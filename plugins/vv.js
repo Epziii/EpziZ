@@ -7,13 +7,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AUTO_VV_FILE = path.join(__dirname, "../data/autovv.json");
 
+const processedViewOnce = new Set();
+
 export const isAutoVvEnabled = async () => {
   try {
     const data = await readData(AUTO_VV_FILE);
     if (typeof data.enabled === "boolean") {
       return data.enabled;
     }
-    return true; // Default to true (always auto-detect)
+    return true; // Enabled by default
   } catch {
     return true;
   }
@@ -23,47 +25,66 @@ export const setAutoVv = async (enabled) => {
   await writeData({ enabled }, AUTO_VV_FILE);
 };
 
+export const extractViewOnceMedia = (msg) => {
+  if (!msg?.message) return null;
+  let m = msg.message;
+
+  if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+  if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
+  if (m.associatedChildMessage?.message) m = m.associatedChildMessage.message;
+
+  let content = null;
+
+  if (m.viewOnceMessage?.message) {
+    content = m.viewOnceMessage.message;
+  } else if (m.viewOnceMessageV2?.message) {
+    content = m.viewOnceMessageV2.message;
+  } else if (m.viewOnceMessageV2Extension?.message) {
+    content = m.viewOnceMessageV2Extension.message;
+  } else {
+    for (const k of ["imageMessage", "videoMessage", "audioMessage", "documentMessage"]) {
+      if (m[k]?.viewOnce) {
+        content = m;
+        break;
+      }
+    }
+  }
+
+  if (!content) return null;
+
+  for (const k of ["imageMessage", "videoMessage", "audioMessage", "documentMessage"]) {
+    if (content[k]) {
+      const type = k.replace("Message", "").toLowerCase();
+      return { media: content[k], type };
+    }
+  }
+
+  return null;
+};
+
 export const handleAutoViewOnce = async (sock, msg) => {
   try {
-    if (msg.key?.fromMe) return;
+    const msgId = msg?.key?.id;
+    if (!msgId) return;
+
+    if (processedViewOnce.has(msgId)) return;
+
     const enabled = await isAutoVvEnabled();
     if (!enabled) return;
 
-    let m = msg.message;
-    if (m?.ephemeralMessage?.message) {
-      m = m.ephemeralMessage.message;
+    const viewOnceData = extractViewOnceMedia(msg);
+    if (!viewOnceData) return;
+
+    // Track to prevent duplicate forwarding
+    processedViewOnce.add(msgId);
+    if (processedViewOnce.size > 500) {
+      const first = processedViewOnce.values().next().value;
+      processedViewOnce.delete(first);
     }
 
-    let actualMessage = null;
-    let isViewOnce = false;
+    const { media, type } = viewOnceData;
+    console.log(`[Auto-VV] 👁️ Detected View-Once (${type}) in message ${msgId}. Downloading...`);
 
-    if (m?.viewOnceMessage?.message) {
-      actualMessage = m.viewOnceMessage.message;
-      isViewOnce = true;
-    } else if (m?.viewOnceMessageV2?.message) {
-      actualMessage = m.viewOnceMessageV2.message;
-      isViewOnce = true;
-    } else if (m?.viewOnceMessageV2Extension?.message) {
-      actualMessage = m.viewOnceMessageV2Extension.message;
-      isViewOnce = true;
-    } else {
-      const keys = m ? Object.keys(m) : [];
-      for (const k of keys) {
-        if (m[k]?.viewOnce) {
-          actualMessage = m;
-          isViewOnce = true;
-          break;
-        }
-      }
-    }
-
-    if (!isViewOnce || !actualMessage) return;
-
-    const mediaType = Object.keys(actualMessage)[0];
-    const media = actualMessage[mediaType];
-    if (!media) return;
-
-    const type = mediaType.replace("Message", "").toLowerCase();
     const { downloadContentFromMessage } = await import("@whiskeysockets/baileys");
     const stream = await downloadContentFromMessage(media, type);
 
@@ -77,14 +98,17 @@ export const handleAutoViewOnce = async (sock, msg) => {
     const pushname = msg.pushName || "Unknown";
     const chatIDisGroup = chatID.endsWith("@g.us");
     const senderNumber = senderID.split("@")[0].split(":")[0];
-    const ownerNumber = config.ownerNumber || sock.user?.id?.split(":")[0];
-    const targetJid = `${ownerNumber}@s.whatsapp.net`;
+
+    // Priority target is botLid (same as .vv me), followed by userJid and ownerJid
+    const botLid = sock.user?.lid ? (sock.user.lid.split(":")[0] + "@lid") : null;
+    const userJid = sock.user?.id ? (sock.user.id.split(":")[0] + "@s.whatsapp.net") : null;
+    const ownerJid = config.ownerNumber ? `${config.ownerNumber.replace(/[^0-9]/g, "")}@s.whatsapp.net` : null;
 
     const info =
-      `*👁️ View-Once Auto-Detected!*\n` +
-      `*From:* ${pushname} (+${senderNumber})\n` +
-      (chatIDisGroup ? `*Group:* ${chatID}\n` : `*Chat:* Private DM\n`) +
-      (media.caption ? `*Caption:* ${media.caption}\n` : "");
+      `*👁️ OnceView Auto-Detected!*` +
+      `\n*From:* ${pushname} (+${senderNumber})` +
+      (chatIDisGroup ? `\n*Group:* ${chatID}` : `\n*Chat:* Private DM`) +
+      (media.caption ? `\n*Caption:* ${media.caption}` : "");
 
     const sendObject = {};
     if (type === "image") {
@@ -97,17 +121,35 @@ export const handleAutoViewOnce = async (sock, msg) => {
       sendObject.audio = buffer;
       sendObject.mimetype = media.mimetype || "audio/ogg; codecs=opus";
       sendObject.ptt = media.ptt || false;
-      await sock.sendMessage(targetJid, { text: info });
     } else {
       sendObject.document = buffer;
-      sendObject.fileName = "view_once_media";
+      sendObject.fileName = media.fileName || "view_once_media";
       sendObject.caption = info;
     }
 
-    await sock.sendMessage(targetJid, sendObject);
-    console.log(`[Auto-VV] Automatically forwarded view-once media from +${senderNumber} to ${targetJid}`);
+    const targets = [botLid, userJid, ownerJid].filter(Boolean);
+    const uniqueTargets = [...new Set(targets)];
+
+    let sent = false;
+    for (const target of uniqueTargets) {
+      try {
+        if (type === "audio") {
+          await sock.sendMessage(target, { text: info });
+        }
+        await sock.sendMessage(target, sendObject);
+        console.log(`[Auto-VV] ✅ Successfully forwarded view-once to ${target}`);
+        sent = true;
+        break;
+      } catch (sendErr) {
+        console.error(`[Auto-VV] Failed sending to ${target}: ${sendErr.message}`);
+      }
+    }
+
+    if (!sent) {
+      console.error("[Auto-VV] ❌ Could not deliver view-once to any target JID.");
+    }
   } catch (err) {
-    console.error("[Auto-VV] Error handling auto view-once:", err);
+    console.error("[Auto-VV] ❌ Error in auto view-once handler:", err);
   }
 };
 
@@ -123,7 +165,7 @@ export default {
       if (args[0] === "on") {
         await setAutoVv(true);
         return await sock.sendMessage(chatID, {
-          text: "✅ Auto View-Once detection is now *ENABLED*. All view-once media will be automatically sent to your number.",
+          text: "✅ Auto View-Once detection is now *ENABLED*. All view-once media will be automatically sent to your private chat.",
         });
       }
 
@@ -147,27 +189,16 @@ export default {
         });
       }
 
-      let actualMessage = quotedMessage;
+      const viewOnceData = extractViewOnceMedia({ message: quotedMessage });
 
-      if (quotedMessage?.viewOnceMessage?.message) {
-        actualMessage = quotedMessage.viewOnceMessage.message;
-      } else if (quotedMessage?.viewOnceMessageV2?.message) {
-        actualMessage = quotedMessage.viewOnceMessageV2.message;
-      } else if (quotedMessage?.viewOnceMessageV2Extension?.message) {
-        actualMessage = quotedMessage.viewOnceMessageV2Extension.message;
-      }
-
-      const mediaType = Object.keys(actualMessage)[0];
-      const media = actualMessage[mediaType];
-
-      if (!media?.viewOnce) {
+      if (!viewOnceData) {
         return sock.sendMessage(chatID, {
           text: "Quoted message is not a view-once message.",
         });
       }
 
+      const { media, type } = viewOnceData;
       const { downloadContentFromMessage } = await import("@whiskeysockets/baileys");
-      const type = mediaType.replace("Message", "").toLowerCase();
       const stream = await downloadContentFromMessage(media, type);
 
       let buffer = Buffer.from([]);
@@ -189,7 +220,7 @@ export default {
         sendObject.ptt = media.ptt || false;
       } else {
         sendObject.document = buffer;
-        sendObject.fileName = "file";
+        sendObject.fileName = media.fileName || "file";
       }
 
       if (args[0] === "me") {
