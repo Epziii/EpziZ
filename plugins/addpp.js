@@ -1,0 +1,32 @@
+import { downloadContentFromMessage } from "@whiskeysockets/baileys";
+
+export default {
+  name: "addpp",
+  description: "Add profile picture",
+  category: "Owner",
+  usage: "Reply to an image with .addpp",
+  execute: async (sock, msg, args, mellow = {}) => {
+    try {
+      const { chatID, quotedMessage, botID } = mellow;
+      const media = quotedMessage?.imageMessage;
+      if (!media) {
+        await sock.sendMessage(chatID, {
+          text: "Reply to an image with .addpp",
+        });
+        return;
+      }
+      const stream = await downloadContentFromMessage(media, "image");
+      let buffer = Buffer.from([]);
+      for await (const chunk of stream) {
+        buffer = Buffer.concat([buffer, chunk]);
+      }
+      await sock.updateProfilePicture(botID, buffer);
+      await sock.sendMessage(chatID, { text: "Profile picture updated" });
+    } catch (error) {
+      console.error("Error in addpp command:", error);
+      await sock.sendMessage(chatID, {
+        text: "Failed to update profile picture.",
+      });
+    }
+  },
+};

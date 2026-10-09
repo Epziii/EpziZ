@@ -1,0 +1,17 @@
+config.env
+*node_modules
+package-lock.json
+*session
+test/
+database/
+temp/
+tmp/
+plugins/eplugins/*.js
+data/*.json
+*.mp4
+*pvv.js
+bin/
+baileys_store.db
+baileys_store.db-wal
+baileys_store.db-shm
+yarn.lock
